@@ -1,0 +1,27 @@
+[package]
+name = "mcp-memory-rust"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance MCP Memory Server in Rust — persistent memory for AI assistants"
+license = "MIT"
+repository = "https://github.com/TWFBusiness/mcp-memory-rust"
+
+[dependencies]
+rmcp = { version = "0.16", features = ["server", "transport-io", "macros"] }
+rusqlite = { version = "0.34", features = ["bundled", "vtab"] }
+fastembed = "5"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+dirs = "6"
+anyhow = "1"
+chrono = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
