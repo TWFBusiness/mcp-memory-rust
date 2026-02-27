@@ -2,7 +2,7 @@
 
 High-performance persistent memory server for AI assistants, implementing the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
 
-Rewrite of [MCP Memory Python](https://github.com/anthropics/claude-code) in pure Rust for 9x faster search, 80x faster cold start, and 50% less RAM.
+Rewrite of MCP Memory Python in pure Rust for 9x faster search, 80x faster cold start, and 50% less RAM.
 
 ---
 
@@ -35,6 +35,7 @@ Servidor MCP que dá memória persistente ao seu assistente AI. Salva decisões,
 - **8 tools MCP**: save, search, context, list, stats, delete, reindex, compact
 - **Embedding local**: all-MiniLM-L6-v2 via ONNX (sem API externa, sem custo)
 - **Background worker**: embeddings processados em background sem bloquear
+- **Hook de conversas**: binário standalone que salva conversas automaticamente (Claude Code)
 
 ### Instalação
 
@@ -47,10 +48,14 @@ Baixe da [página de releases](https://github.com/TWFBusiness/mcp-memory-rust/re
 - `mcp-memory-rust-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64
 - `mcp-memory-rust-x86_64-pc-windows-msvc.zip` — Windows x86_64
 
+Cada release inclui dois binários:
+- `mcp-memory-rust` — servidor MCP (funciona em qualquer IDE com suporte MCP)
+- `mcp-memory-hook` — hook de conversas (exclusivo para Claude Code)
+
 ```bash
 # macOS/Linux — extrair e tornar executável
 tar xzf mcp-memory-rust-*.tar.gz
-chmod +x mcp-memory-rust
+chmod +x mcp-memory-rust mcp-memory-hook
 ```
 
 #### Compilar do fonte
@@ -59,12 +64,14 @@ chmod +x mcp-memory-rust
 git clone https://github.com/TWFBusiness/mcp-memory-rust.git
 cd mcp-memory-rust
 cargo build --release
-# Binário em: target/release/mcp-memory-rust
+# Binários em: target/release/mcp-memory-rust e target/release/mcp-memory-hook
 ```
 
 ### Configuração por IDE
 
 #### Claude Code (CLI)
+
+**1. Servidor MCP** (memória persistente):
 
 ```bash
 claude mcp add -s user memory-rust /caminho/para/mcp-memory-rust
@@ -81,6 +88,48 @@ Ou edite `~/.claude.json`:
   }
 }
 ```
+
+**2. Hook de conversas** (salva automaticamente toda conversa):
+
+Edite `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/caminho/para/mcp-memory-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/caminho/para/mcp-memory-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+O hook captura automaticamente:
+- **UserPromptSubmit**: acumula a pergunta do usuário na sessão
+- **Stop**: salva a sessão completa no `personality.db` (UPSERT — uma memória por sessão)
+- Extrai: tools usadas, arquivos mencionados, tópicos da conversa
+- Executa em **<10ms** e usa **6 MB de RAM** (sem carregar modelo de embedding)
+- Os embeddings são gerados depois pelo background worker do servidor MCP
+
+> **Nota**: O hook é exclusivo para Claude Code. Cursor e Codex não possuem sistema de hooks — nesses IDEs, use apenas o servidor MCP e instrua o assistente a chamar `memory_save` nas instruções do projeto.
 
 #### Cursor
 
@@ -108,10 +157,15 @@ Ou edite `.cursor/mcp.json` no projeto:
 }
 ```
 
+Para salvar conversas automaticamente no Cursor, adicione nas instruções do projeto (`.cursorrules`):
+
+```
+Após cada resposta substantiva, chame memory_save com scope="personality" para salvar decisões, implementações e soluções relevantes.
+```
+
 #### OpenAI Codex CLI
 
 ```bash
-# Adicione ao config do Codex
 codex mcp add memory-rust /caminho/para/mcp-memory-rust
 ```
 
@@ -119,6 +173,12 @@ Ou configure via variável de ambiente:
 
 ```bash
 export MCP_SERVERS='{"memory-rust":{"command":"/caminho/para/mcp-memory-rust"}}'
+```
+
+Para salvar conversas automaticamente no Codex, adicione nas instruções do projeto (`AGENTS.md` ou `codex.md`):
+
+```
+Após cada resposta substantiva, chame memory_save com scope="personality" para salvar decisões, implementações e soluções relevantes.
 ```
 
 ### Tools disponíveis
@@ -139,7 +199,7 @@ export MCP_SERVERS='{"memory-rust":{"command":"/caminho/para/mcp-memory-rust"}}'
 ```
 ~/.mcp-memoria/data/
 ├── global.db        # Padrões permanentes
-├── personality.db   # Memórias cross-project
+├── personality.db   # Memórias cross-project (conversas salvas aqui)
 └── <project>/.mcp-memoria/project.db  # Específico do projeto
 ```
 
@@ -170,6 +230,7 @@ MCP server that gives persistent memory to your AI assistant. Saves decisions, p
 - **8 MCP tools**: save, search, context, list, stats, delete, reindex, compact
 - **Local embedding**: all-MiniLM-L6-v2 via ONNX (no external API, no cost)
 - **Background worker**: embeddings processed in background without blocking
+- **Conversation hook**: standalone binary that auto-saves conversations (Claude Code only)
 
 ### Installation
 
@@ -182,10 +243,14 @@ Download from the [releases page](https://github.com/TWFBusiness/mcp-memory-rust
 - `mcp-memory-rust-x86_64-unknown-linux-gnu.tar.gz` — Linux x86_64
 - `mcp-memory-rust-x86_64-pc-windows-msvc.zip` — Windows x86_64
 
+Each release includes two binaries:
+- `mcp-memory-rust` — MCP server (works with any IDE that supports MCP)
+- `mcp-memory-hook` — conversation hook (Claude Code only)
+
 ```bash
 # macOS/Linux — extract and make executable
 tar xzf mcp-memory-rust-*.tar.gz
-chmod +x mcp-memory-rust
+chmod +x mcp-memory-rust mcp-memory-hook
 ```
 
 #### Build from source
@@ -194,12 +259,14 @@ chmod +x mcp-memory-rust
 git clone https://github.com/TWFBusiness/mcp-memory-rust.git
 cd mcp-memory-rust
 cargo build --release
-# Binary at: target/release/mcp-memory-rust
+# Binaries at: target/release/mcp-memory-rust and target/release/mcp-memory-hook
 ```
 
 ### IDE Configuration
 
 #### Claude Code (CLI)
+
+**1. MCP Server** (persistent memory):
 
 ```bash
 claude mcp add -s user memory-rust /path/to/mcp-memory-rust
@@ -216,6 +283,48 @@ Or edit `~/.claude.json`:
   }
 }
 ```
+
+**2. Conversation hook** (auto-saves every conversation):
+
+Edit `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/mcp-memory-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/mcp-memory-hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook automatically captures:
+- **UserPromptSubmit**: accumulates the user's prompt in the session
+- **Stop**: saves the full session to `personality.db` (UPSERT — one memory per session)
+- Extracts: tools used, files mentioned, conversation topics
+- Runs in **<10ms** using **6 MB RAM** (no embedding model loaded)
+- Embeddings are generated later by the MCP server's background worker
+
+> **Note**: The hook is exclusive to Claude Code. Cursor and Codex don't have a hooks system — for those IDEs, use only the MCP server and instruct the assistant to call `memory_save` in your project instructions.
 
 #### Cursor
 
@@ -243,10 +352,15 @@ Or edit `.cursor/mcp.json` in your project:
 }
 ```
 
+To auto-save conversations in Cursor, add to your project instructions (`.cursorrules`):
+
+```
+After every substantive response, call memory_save with scope="personality" to save relevant decisions, implementations, and solutions.
+```
+
 #### OpenAI Codex CLI
 
 ```bash
-# Add to Codex config
 codex mcp add memory-rust /path/to/mcp-memory-rust
 ```
 
@@ -254,6 +368,12 @@ Or configure via environment variable:
 
 ```bash
 export MCP_SERVERS='{"memory-rust":{"command":"/path/to/mcp-memory-rust"}}'
+```
+
+To auto-save conversations in Codex, add to your project instructions (`AGENTS.md` or `codex.md`):
+
+```
+After every substantive response, call memory_save with scope="personality" to save relevant decisions, implementations, and solutions.
 ```
 
 ### Available tools
@@ -274,7 +394,7 @@ export MCP_SERVERS='{"memory-rust":{"command":"/path/to/mcp-memory-rust"}}'
 ```
 ~/.mcp-memoria/data/
 ├── global.db        # Permanent patterns
-├── personality.db   # Cross-project memories
+├── personality.db   # Cross-project memories (conversations saved here)
 └── <project>/.mcp-memoria/project.db  # Project-specific
 ```
 
@@ -283,6 +403,7 @@ export MCP_SERVERS='{"memory-rust":{"command":"/path/to/mcp-memory-rust"}}'
 ```
 src/
 ├── main.rs        # MCP server (rmcp), 8 tool handlers
+├── hook.rs        # Conversation hook for Claude Code (standalone binary)
 ├── storage.rs     # SQLite: schema, CRUD, FTS5, scopes
 ├── search.rs      # Hybrid search, BM25, cosine, temporal decay
 ├── embedding.rs   # fastembed wrapper, cache, background worker

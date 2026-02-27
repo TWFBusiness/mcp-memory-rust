@@ -44,7 +44,7 @@ jobs:
         if: "!contains(matrix.target, 'windows')"
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../mcp-memory-rust-${{ matrix.target }}.tar.gz mcp-memory-rust
+          tar czf ../../../mcp-memory-rust-${{ matrix.target }}.tar.gz mcp-memory-rust mcp-memory-hook
           cd ../../..
 
       - name: Package (Windows)
@@ -52,7 +52,7 @@ jobs:
         shell: pwsh
         run: |
           cd target/${{ matrix.target }}/release
-          Compress-Archive -Path mcp-memory-rust.exe -DestinationPath ../../../mcp-memory-rust-${{ matrix.target }}.zip
+          Compress-Archive -Path mcp-memory-rust.exe,mcp-memory-hook.exe -DestinationPath ../../../mcp-memory-rust-${{ matrix.target }}.zip
           cd ../../..
 
       - name: Upload artifact
