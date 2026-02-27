@@ -21,6 +21,10 @@ dirs = "6"
 anyhow = "1"
 chrono = "0.4"
 
+[[bin]]
+name = "mcp-memory-hook"
+path = "src/hook.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
