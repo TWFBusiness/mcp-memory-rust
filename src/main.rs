@@ -1,4 +1,6 @@
+mod autotag;
 mod chunking;
+mod consolidation;
 mod dedup;
 mod embedding;
 mod search;
@@ -101,6 +103,27 @@ pub struct CompactParams {
     pub scope: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConsolidateParams {
+    #[schemars(description = "Scope: personality, project, global, all")]
+    #[serde(default = "default_scope_personality")]
+    pub scope: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LinkParams {
+    #[schemars(description = "Source memory ID")]
+    pub from_id: String,
+    #[schemars(description = "Target memory ID")]
+    pub to_id: String,
+    #[schemars(description = "Relation: relates_to, supersedes, derived_from")]
+    #[serde(default = "default_relation")]
+    pub relation: String,
+    #[schemars(description = "Scope of the memories")]
+    #[serde(default = "default_scope_personality")]
+    pub scope: String,
+}
+
 // ---- Defaults ----
 fn default_type() -> String { "note".into() }
 fn default_scope_project() -> String { "project".into() }
@@ -109,6 +132,17 @@ fn default_scope_all() -> String { "all".into() }
 fn default_scope_personality() -> String { "personality".into() }
 fn default_limit_5() -> usize { 5 }
 fn default_limit_10() -> usize { 10 }
+fn default_relation() -> String { "relates_to".into() }
+
+// ---- Scope weights for cross-scope merge ----
+fn scope_weight(scope: &str) -> f64 {
+    match scope {
+        "project" => 1.0,
+        "personality" => 0.85,
+        "global" => 0.7,
+        _ => 0.8,
+    }
+}
 
 // ---- MCP Server ----
 
@@ -135,6 +169,71 @@ impl MemoryServer {
         }
     }
 
+    /// Cross-scope parallel search com tokio::join! e scope weights
+    async fn do_search_parallel(
+        &self,
+        query: String,
+        scope: String,
+        limit: usize,
+    ) -> Vec<(String, search::SearchResult)> {
+        let dbs = storage::resolve_scope_dbs(&scope, &self.paths);
+        let engine = self.embedding_engine.clone();
+
+        // Compute embedding once (blocking)
+        let query_clone = query.clone();
+        let query_emb = tokio::task::spawn_blocking(move || {
+            engine.embed(&query_clone).ok()
+        })
+        .await
+        .ok()
+        .flatten();
+
+        // Parallelizar buscas por scope
+        let mut handles = Vec::new();
+        for (scope_name, db_path) in dbs {
+            if !db_path.exists() && scope_name == "project" {
+                continue;
+            }
+            let query = query.clone();
+            let query_emb = query_emb.clone();
+            let scope_name = scope_name.clone();
+
+            handles.push(tokio::task::spawn_blocking(move || {
+                let conn = match storage::init_db(&db_path) {
+                    Ok(c) => c,
+                    Err(_) => return vec![],
+                };
+                let results = search::search_hybrid(
+                    &conn,
+                    &query,
+                    query_emb.as_deref(),
+                    limit,
+                );
+                let weight = scope_weight(&scope_name);
+                results
+                    .into_iter()
+                    .map(|mut r| {
+                        r.relevance *= weight;
+                        r.relevance = (r.relevance * 10000.0).round() / 10000.0;
+                        (scope_name.clone(), r)
+                    })
+                    .collect::<Vec<_>>()
+            }));
+        }
+
+        let mut all_results = Vec::new();
+        for handle in handles {
+            if let Ok(results) = handle.await {
+                all_results.extend(results);
+            }
+        }
+
+        all_results.sort_by(|a, b| b.1.relevance.partial_cmp(&a.1.relevance).unwrap());
+        all_results.truncate(limit);
+        all_results
+    }
+
+    /// Sync version for tools that need it
     fn do_search(
         &self,
         query: &str,
@@ -160,7 +259,10 @@ impl MemoryServer {
                 query_emb.as_deref(),
                 limit,
             );
-            for r in results {
+            let weight = scope_weight(&scope_name);
+            for mut r in results {
+                r.relevance *= weight;
+                r.relevance = (r.relevance * 10000.0).round() / 10000.0;
                 all_results.push((scope_name.clone(), r));
             }
         }
@@ -190,11 +292,11 @@ impl MemoryServer {
     // ---- Tools ----
 
     #[tool(description = "USE AUTOMATICALLY at the start of each conversation. Returns relevant memories for the current context (project + global). Works as an automatic 'recall'.")]
-    fn memory_context(
+    async fn memory_context(
         &self,
         Parameters(params): Parameters<ContextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results = self.do_search(&params.query, "all", 8);
+        let results = self.do_search_parallel(params.query, "all".into(), 8).await;
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -215,11 +317,11 @@ impl MemoryServer {
     }
 
     #[tool(description = "Search specific memories when you need detailed information about past decisions, patterns, or preferences. Use 'personality' scope to find similar implementations from other projects.")]
-    fn memory_search(
+    async fn memory_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results = self.do_search(&params.query, &params.scope, params.limit);
+        let results = self.do_search_parallel(params.query, params.scope, params.limit).await;
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -246,7 +348,7 @@ impl MemoryServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Save important decision, pattern, or implementation. Use after: (1) making architecture decisions, (2) defining code patterns, (3) learning user preferences, (4) implementing new features (use scope='personality' + type='implementation').")]
+    #[tool(description = "Save important decision, pattern, or implementation. Auto-tags are extracted automatically. Use after: (1) making architecture decisions, (2) defining code patterns, (3) learning user preferences, (4) implementing new features.")]
     fn memory_save(
         &self,
         Parameters(params): Parameters<SaveParams>,
@@ -311,11 +413,10 @@ impl MemoryServer {
                     ""
                 };
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Memory saved ({})\n- Type: {}\n- ID: {}\n- Tags: {}\n- Embedding: queued{}",
+                    "Memory saved ({})\n- Type: {}\n- ID: {}\n- Tags: auto-enriched\n- Embedding: queued (f16 compressed){}",
                     params.scope,
                     params.r#type,
                     result.id,
-                    if tags.is_empty() { "none" } else { &tags },
                     dedup_info
                 ))]))
             }
@@ -376,7 +477,7 @@ impl MemoryServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    #[tool(description = "Show memory statistics (total, indexed, by type).")]
+    #[tool(description = "Show memory statistics (total, indexed, edges, archived, by type).")]
     fn memory_stats(
         &self,
         Parameters(_params): Parameters<StatsParams>,
@@ -393,12 +494,14 @@ impl MemoryServer {
             };
             let stats = storage::get_stats(&conn);
             output.push_str(&format!(
-                "**{}** ({}):\n- Total: {}\n- Indexed (embedding): {}\n- Chunks: {}\n- Cache entries: {}\n- By type: {:?}\n\n",
+                "**{}** ({}):\n- Total: {}\n- Archived: {}\n- Indexed: {}\n- Chunks: {}\n- Edges: {}\n- Cache: {}\n- By type: {:?}\n\n",
                 label,
                 db_path.display(),
                 stats.total,
+                stats.archived,
                 stats.indexed,
                 stats.chunks,
+                stats.edges,
                 stats.cache_entries,
                 stats.by_type,
             ));
@@ -409,20 +512,23 @@ impl MemoryServer {
                 if let Ok(conn) = storage::init_db(&project_db) {
                     let stats = storage::get_stats(&conn);
                     output.push_str(&format!(
-                        "**Project** ({}):\n- Total: {}\n- Indexed: {}\n- Chunks: {}\n- Cache: {}\n- By type: {:?}\n\n",
-                        project_db.display(), stats.total, stats.indexed, stats.chunks, stats.cache_entries, stats.by_type,
+                        "**Project** ({}):\n- Total: {}\n- Archived: {}\n- Indexed: {}\n- Chunks: {}\n- Edges: {}\n- Cache: {}\n- By type: {:?}\n\n",
+                        project_db.display(), stats.total, stats.archived, stats.indexed,
+                        stats.chunks, stats.edges, stats.cache_entries, stats.by_type,
                     ));
                 }
             }
         }
 
-        output.push_str("**Config**:\n");
-        output.push_str("- Embeddings: enabled (fastembed)\n");
+        output.push_str("**Config v0.2**:\n");
+        output.push_str("- Embeddings: f16 compressed (50% less storage)\n");
         output.push_str("- Model: all-MiniLM-L6-v2\n");
-        output.push_str("- Search weights: vector=0.7, text=0.3\n");
+        output.push_str("- Search: hybrid (vector=0.7, text=0.3) + importance boost + graph 1-hop\n");
+        output.push_str("- Scope weights: project=1.0, personality=0.85, global=0.7\n");
         output.push_str("- Temporal decay: 0.15\n");
         output.push_str("- Dedup threshold: 0.85\n");
-        output.push_str("- Chunk size: 400 words (overlap 80)\n");
+        output.push_str("- Auto-tagging: enabled (~100 tech keywords)\n");
+        output.push_str("- Consolidation: available (memory_consolidate)\n");
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -477,7 +583,7 @@ impl MemoryServer {
         }
     }
 
-    #[tool(description = "Reindex all memories that don't have embeddings yet. Use when embedding backlog is large.")]
+    #[tool(description = "Reindex all memories that don't have embeddings yet.")]
     fn memory_reindex(
         &self,
         Parameters(params): Parameters<ReindexParams>,
@@ -504,13 +610,13 @@ impl MemoryServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "## Reindex Started\n\nQueued {} memories for embedding.\n{}\n\nWorker processing in background.",
+            "## Reindex Started\n\nQueued {} memories for embedding (f16).\n{}\n\nWorker processing in background.",
             total,
             details.join("\n")
         ))]))
     }
 
-    #[tool(description = "Consolidate conversation memories by project. Reduces noise by merging multiple conversation entries into summaries. Also runs VACUUM + FTS rebuild.")]
+    #[tool(description = "Compact database: VACUUM + FTS rebuild + TTL cleanup + importance decay.")]
     fn memory_compact(
         &self,
         Parameters(params): Parameters<CompactParams>,
@@ -534,11 +640,92 @@ impl MemoryServer {
             }
         };
 
-        let _ = storage::compact_db(&conn);
+        match storage::compact_db(&conn, &params.scope) {
+            Ok(result) => {
+                Ok(CallToolResult::success(vec![Content::text(format!(
+                    "## Compaction Complete\n\n- TTL applied: {} memories\n- Importance decayed: {}\n- VACUUM + FTS rebuild done.",
+                    result.ttl_applied, result.decayed
+                ))]))
+            }
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error: {}", e
+            ))])),
+        }
+    }
 
-        Ok(CallToolResult::success(vec![Content::text(
-            "## Compaction Complete\n\nVACUUM + FTS rebuild done.",
-        )]))
+    #[tool(description = "Consolidate memories: merge similar entries, summarize conversation sessions by project, archive old duplicates. Reduces noise and improves search quality.")]
+    fn memory_consolidate(
+        &self,
+        Parameters(params): Parameters<ConsolidateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let dbs = storage::resolve_scope_dbs(&params.scope, &self.paths);
+        let mut total_result = consolidation::ConsolidationResult::default();
+
+        for (scope_name, db_path) in dbs {
+            if !db_path.exists() && scope_name == "project" {
+                continue;
+            }
+            let conn = match storage::init_db(&db_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let result = consolidation::run_consolidation(&conn);
+            total_result.conversations_consolidated += result.conversations_consolidated;
+            total_result.similar_merged += result.similar_merged;
+            total_result.archived += result.archived;
+        }
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "## Consolidation Complete\n\n- Conversation groups consolidated: {}\n- Similar memories merged: {}\n- Total archived: {}",
+            total_result.conversations_consolidated,
+            total_result.similar_merged,
+            total_result.archived,
+        ))]))
+    }
+
+    #[tool(description = "Create a manual link between two memories. Relations: relates_to, supersedes, derived_from.")]
+    fn memory_link(
+        &self,
+        Parameters(params): Parameters<LinkParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.from_id.is_empty() || params.to_id.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Error: both from_id and to_id required.",
+            )]));
+        }
+
+        let valid_relations = ["relates_to", "supersedes", "derived_from"];
+        if !valid_relations.contains(&params.relation.as_str()) {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "Error: relation must be: relates_to, supersedes, or derived_from",
+            )]));
+        }
+
+        let db_path = match self.resolve_save_db(&params.scope) {
+            Some(p) => p,
+            None => {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "Error: project not detected.",
+                )]));
+            }
+        };
+
+        let conn = match storage::init_db(&db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(CallToolResult::success(vec![Content::text(format!(
+                    "Error: {}",
+                    e
+                ))]));
+            }
+        };
+
+        storage::create_edge(&conn, &params.from_id, &params.to_id, &params.relation);
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Link created: {} --[{}]--> {}",
+            params.from_id, params.relation, params.to_id
+        ))]))
     }
 }
 
@@ -547,9 +734,11 @@ impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "MCP Memory Server (Rust) — Persistent memory for AI assistants. \
+                "MCP Memory Server (Rust) v0.2 — Persistent memory for AI assistants. \
                  Hybrid search (0.7 embedding + 0.3 BM25), temporal decay, \
-                 Jaccard deduplication, chunking. 3 scopes: global, personality, project."
+                 Jaccard deduplication, chunking. 3 scopes: global, personality, project. \
+                 v0.2: auto-tagging, importance scoring, graph relations, f16 embeddings, \
+                 consolidation, TTL, cross-scope parallel search."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -571,17 +760,33 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    info!("MCP Memory Server (Rust) Starting...");
+    info!("MCP Memory Server (Rust) v0.2 Starting...");
 
     let paths = MemoryPaths::new();
     info!("Global DB: {}", paths.global_db.display());
     info!("Personality DB: {}", paths.personality_db.display());
 
-    // Inicializa DBs
-    storage::init_db(&paths.global_db)?;
-    storage::init_db(&paths.personality_db)?;
+    // Inicializa DBs com novo schema
+    let conn_global = storage::init_db(&paths.global_db)?;
+    let conn_personality = storage::init_db(&paths.personality_db)?;
 
-    // Carrega embedding engine (compartilhado entre server e worker)
+    // Migrar embeddings f32 → f16 em background
+    let migrated_global = embedding::migrate_embeddings_to_f16(&conn_global);
+    let migrated_personality = embedding::migrate_embeddings_to_f16(&conn_personality);
+    if migrated_global + migrated_personality > 0 {
+        info!(
+            "Migrated {} embeddings to f16 (global: {}, personality: {})",
+            migrated_global + migrated_personality,
+            migrated_global,
+            migrated_personality
+        );
+    }
+
+    // Drop connections antes de iniciar server
+    drop(conn_global);
+    drop(conn_personality);
+
+    // Carrega embedding engine
     let engine = Arc::new(EmbeddingEngine::new()?);
 
     // Background worker
@@ -589,9 +794,11 @@ async fn main() -> Result<()> {
 
     let server = MemoryServer::new(paths, engine, job_sender);
 
-    info!("Search: hybrid (vector=0.7, text=0.3)");
+    info!("Search: hybrid (vector=0.7, text=0.3) + importance + graph 1-hop");
+    info!("Embeddings: f16 compressed (50% less storage)");
+    info!("Auto-tagging: ~100 tech keywords");
     info!("Dedup: Jaccard threshold=0.85");
-    info!("Chunking: 400w chunks, 80w overlap");
+    info!("Scope weights: project=1.0, personality=0.85, global=0.7");
 
     let service = server
         .serve(stdio())
@@ -599,7 +806,7 @@ async fn main() -> Result<()> {
         .inspect_err(|e| tracing::error!("Erro ao iniciar server: {:?}", e))
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    info!("MCP server rodando via stdio");
+    info!("MCP server v0.2 rodando via stdio");
     service.waiting().await?;
 
     Ok(())

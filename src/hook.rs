@@ -2,10 +2,10 @@
 ///
 /// Captura eventos via stdin (JSON):
 /// - UserPromptSubmit: acumula pergunta do usuário
-/// - Stop: atualiza memória da sessão com resumo
+/// - Stop: atualiza memória da sessão com resumo + transcript do assistente
 ///
 /// Uma memória por sessão (UPSERT com ID determinístico).
-/// Formato estruturado: extrai tools, arquivos, tópicos.
+/// Formato estruturado: extrai tools, arquivos, tópicos, auto-tags.
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod autotag;
 mod chunking;
 mod dedup;
 mod embedding;
@@ -30,11 +31,18 @@ struct HookInput {
     cwd: Option<String>,
     prompt: Option<String>,
     stop_hook_active_tools: Option<Vec<ToolInfo>>,
+    transcript: Option<Vec<TranscriptMessage>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ToolInfo {
     name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptMessage {
+    role: Option<String>,
+    content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -108,7 +116,6 @@ fn save_session(session: &SessionData) {
 
 fn extract_files(text: &str) -> Vec<String> {
     let mut files = HashSet::new();
-    // Regex simples: paths como /foo/bar.ext
     for word in text.split_whitespace() {
         let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
         if w.starts_with('/') && w.contains('.') && w.len() > 3 {
@@ -119,6 +126,40 @@ fn extract_files(text: &str) -> Vec<String> {
     result.sort();
     result.truncate(20);
     result
+}
+
+/// Extrai texto do último assistant message no transcript
+fn extract_assistant_response(transcript: &[TranscriptMessage]) -> Option<String> {
+    // Percorre de trás pra frente buscando último assistant
+    for msg in transcript.iter().rev() {
+        if msg.role.as_deref() == Some("assistant") {
+            if let Some(content) = &msg.content {
+                let text = match content {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Array(arr) => {
+                        // Array de content blocks — extrair texto
+                        arr.iter()
+                            .filter_map(|item| {
+                                if item.get("type")?.as_str()? == "text" {
+                                    item.get("text")?.as_str().map(|s| s.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    }
+                    _ => continue,
+                };
+                if !text.is_empty() {
+                    // Truncar a 1000 chars
+                    let truncated: String = text.chars().take(1000).collect();
+                    return Some(truncated);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ---- Build content ----
@@ -160,6 +201,15 @@ fn build_session_content(session: &SessionData) -> String {
         }
     }
 
+    // Incluir última resposta do assistente se disponível
+    let assistant_turns: Vec<&Turn> = session.turns.iter()
+        .filter(|t| t.role == "assistant" && t.content.len() > 20)
+        .collect();
+    if let Some(last) = assistant_turns.last() {
+        let truncated: String = last.content.chars().take(500).collect();
+        lines.push(format!("Last response: {}", truncated));
+    }
+
     lines.join("\n")
 }
 
@@ -172,10 +222,11 @@ fn save_to_db(session: &SessionData) -> Option<String> {
 
     let mem_id = session_memory_id(&session.session_id);
     let content = build_session_content(session);
-    let tags = format!(
-        "conversation,claude-code,{},auto-saved",
-        session.project
-    );
+
+    // Auto-tag do conteúdo da sessão
+    let auto_tags = autotag::extract_tags(&content);
+    let base_tags = format!("conversation,claude-code,{},auto-saved", session.project);
+    let tags = autotag::merge_tags(&base_tags, &auto_tags);
 
     let db_path = personality_db_path();
     let conn = storage::init_db(&db_path).ok()?;
@@ -198,8 +249,8 @@ fn save_to_db(session: &SessionData) -> Option<String> {
         .ok()?;
     } else {
         conn.execute(
-            "INSERT INTO memories (id, type, content, tags) \
-             VALUES (?, 'conversation', ?, ?)",
+            "INSERT INTO memories (id, type, content, tags, importance) \
+             VALUES (?, 'conversation', ?, ?, 0.3)",
             rusqlite::params![mem_id, content, tags],
         )
         .ok()?;
@@ -275,22 +326,30 @@ fn handle_stop(input: &HookInput) {
         }
     }
 
-    // Turno do assistente
-    let tool_names: Vec<String> = input
-        .stop_hook_active_tools
-        .as_ref()
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|t| t.name.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let content = if tool_names.is_empty() {
-        "Responded".to_string()
+    // Extrair resposta do assistente do transcript
+    let assistant_content = if let Some(transcript) = &input.transcript {
+        extract_assistant_response(transcript)
     } else {
-        format!("Tools: {}", tool_names.join(", "))
+        None
+    };
+
+    // Turno do assistente — agora com conteúdo real se disponível
+    let content = if let Some(response) = &assistant_content {
+        response.clone()
+    } else {
+        let tool_names: Vec<String> = input
+            .stop_hook_active_tools
+            .as_ref()
+            .map(|tools| {
+                tools.iter().filter_map(|t| t.name.clone()).collect()
+            })
+            .unwrap_or_default();
+
+        if tool_names.is_empty() {
+            "Responded".to_string()
+        } else {
+            format!("Tools: {}", tool_names.join(", "))
+        }
     };
 
     session.turns.push(Turn {
@@ -308,9 +367,10 @@ fn handle_stop(input: &HookInput) {
     save_session(&session);
 
     eprintln!(
-        "[Memory Hook] Updated session memory {} ({} turns)",
+        "[Memory Hook] Updated session memory {} ({} turns, transcript: {})",
         mem_id.unwrap_or_else(|| "none".into()),
-        session.turns.len()
+        session.turns.len(),
+        if input.transcript.is_some() { "yes" } else { "no" }
     );
 }
 

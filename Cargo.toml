@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory-rust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "High-performance MCP Memory Server in Rust — persistent memory for AI assistants"
 license = "MIT"
@@ -20,6 +20,7 @@ sha2 = "0.10"
 dirs = "6"
 anyhow = "1"
 chrono = "0.4"
+half = "2"
 
 [[bin]]
 name = "mcp-memory-hook"
