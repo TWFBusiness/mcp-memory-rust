@@ -132,23 +132,153 @@ pub struct EmbeddingJob {
 pub fn start_background_worker(
     engine: Arc<EmbeddingEngine>,
 ) -> mpsc::Sender<EmbeddingJob> {
-    let (tx, mut rx) = mpsc::channel::<EmbeddingJob>(256);
+    let (tx, mut rx) = mpsc::channel::<EmbeddingJob>(1024);
 
     tokio::spawn(async move {
-        info!("Background embedding worker started");
-        while let Some(job) = rx.recv().await {
-            let engine = engine.clone();
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = process_embedding_job(&engine, &job) {
-                    warn!("Embedding job error for {}: {}", job.record_id, e);
+        info!("Background embedding worker started (batch mode)");
+
+        loop {
+            // Espera pelo primeiro job
+            let first = match rx.recv().await {
+                Some(job) => job,
+                None => break,
+            };
+
+            // Coleta mais jobs disponíveis no canal (até BATCH_SIZE)
+            const BATCH_SIZE: usize = 16;
+            let mut batch = vec![first];
+            while batch.len() < BATCH_SIZE {
+                match rx.try_recv() {
+                    Ok(job) => batch.push(job),
+                    Err(_) => break,
                 }
+            }
+
+            let engine = engine.clone();
+            let batch_len = batch.len();
+            tokio::task::spawn_blocking(move || {
+                process_embedding_batch(&engine, &batch);
             })
             .await
             .ok();
+
+            if batch_len > 1 {
+                info!("Processed embedding batch of {} jobs", batch_len);
+            }
         }
     });
 
     tx
+}
+
+/// Processa batch de jobs — usa embed_batch para textos principais, embed individual para chunks
+fn process_embedding_batch(engine: &EmbeddingEngine, jobs: &[EmbeddingJob]) {
+    // Agrupar por db_path para abrir cada conexão uma vez
+    let mut by_db: std::collections::HashMap<String, Vec<&EmbeddingJob>> = std::collections::HashMap::new();
+    for job in jobs {
+        by_db.entry(job.db_path.clone()).or_default().push(job);
+    }
+
+    for (db_path, db_jobs) in &by_db {
+        let conn = match Connection::open(db_path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Cannot open DB {}: {}", db_path, e);
+                continue;
+            }
+        };
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+
+        let model_name = "all-MiniLM-L6-v2";
+
+        // Separar jobs que precisam de embedding (não cached) vs cached
+        let mut needs_embedding: Vec<(&EmbeddingJob, usize)> = Vec::new();
+        let mut cached: Vec<(&EmbeddingJob, Vec<f32>)> = Vec::new();
+
+        for (idx, job) in db_jobs.iter().enumerate() {
+            if let Some(emb) = get_cached_embedding(&conn, &job.content, model_name) {
+                cached.push((job, emb));
+            } else {
+                needs_embedding.push((job, idx));
+            }
+        }
+
+        // Batch embed os que não estão no cache
+        if !needs_embedding.is_empty() {
+            let texts: Vec<String> = needs_embedding.iter().map(|(j, _)| j.content.clone()).collect();
+            match engine.embed_batch(&texts) {
+                Ok(embeddings) => {
+                    for (i, emb) in embeddings.into_iter().enumerate() {
+                        let job = needs_embedding[i].0;
+                        store_cached_embedding(&conn, &job.content, model_name, &emb);
+                        save_embedding_to_record(&conn, job, &emb, engine, model_name);
+                    }
+                }
+                Err(e) => {
+                    // Fallback: tentar individualmente
+                    warn!("Batch embed failed, falling back to individual: {}", e);
+                    for (job, _) in &needs_embedding {
+                        if let Err(e) = process_embedding_job(engine, job) {
+                            warn!("Embedding job error for {}: {}", job.record_id, e);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Processar cached
+        for (job, emb) in &cached {
+            save_embedding_to_record(&conn, job, emb, engine, model_name);
+        }
+    }
+}
+
+/// Salva embedding no record + processa chunks se necessário
+fn save_embedding_to_record(
+    conn: &Connection,
+    job: &EmbeddingJob,
+    embedding: &[f32],
+    engine: &EmbeddingEngine,
+    model_name: &str,
+) {
+    use crate::chunking::chunk_text;
+
+    let blob = compress_embedding(embedding);
+    let _ = conn.execute(
+        "UPDATE memories SET embedding = ? WHERE id = ?",
+        rusqlite::params![blob, job.record_id],
+    );
+
+    // Chunk conteúdos longos
+    let chunks = chunk_text(&job.content, 400, 80);
+    if chunks.len() > 1 {
+        let _ = conn.execute(
+            "DELETE FROM memory_chunks WHERE memory_id = ?",
+            rusqlite::params![job.record_id],
+        );
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            let chunk_id = format!("{}_c{}", job.record_id, idx);
+            let chunk_emb = if let Some(cached) = get_cached_embedding(conn, chunk, model_name) {
+                cached
+            } else {
+                match engine.embed(chunk) {
+                    Ok(emb) => {
+                        store_cached_embedding(conn, chunk, model_name, &emb);
+                        emb
+                    }
+                    Err(_) => continue,
+                }
+            };
+            let chunk_blob = compress_embedding(&chunk_emb);
+            let _ = conn.execute(
+                "INSERT OR REPLACE INTO memory_chunks \
+                 (id, memory_id, chunk_index, chunk_text, embedding) \
+                 VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![chunk_id, job.record_id, idx as i64, chunk, chunk_blob],
+            );
+        }
+    }
 }
 
 fn process_embedding_job(engine: &EmbeddingEngine, job: &EmbeddingJob) -> Result<()> {

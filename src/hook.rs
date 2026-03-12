@@ -1,11 +1,12 @@
-/// Hook para Claude Code: salva conversa automaticamente no personality.db
+/// Hook para Claude Code: salva conversa automaticamente no personality.db + project.db
 ///
 /// Captura eventos via stdin (JSON):
-/// - UserPromptSubmit: acumula pergunta do usuário
+/// - UserPromptSubmit: acumula pergunta do usuário + salva no DB imediatamente
 /// - Stop: atualiza memória da sessão com resumo + transcript do assistente
 ///
 /// Uma memória por sessão (UPSERT com ID determinístico).
 /// Formato estruturado: extrai tools, arquivos, tópicos, auto-tags.
+/// Salva em personality.db (sempre) e project.db (se cwd disponível).
 use std::collections::HashSet;
 use std::io::Read;
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ struct SessionData {
     turns: Vec<Turn>,
     session_id: String,
     project: String,
+    cwd: String,
     tools: Vec<String>,
     files: Vec<String>,
 }
@@ -118,7 +120,11 @@ fn extract_files(text: &str) -> Vec<String> {
     let mut files = HashSet::new();
     for word in text.split_whitespace() {
         let w = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-');
-        if w.starts_with('/') && w.contains('.') && w.len() > 3 {
+        // Aceita paths absolutos (/src/main.rs) e relativos (src/main.rs, ./config.yaml)
+        let is_path = (w.starts_with('/') || w.starts_with("./") || w.contains('/'))
+            && w.contains('.')
+            && w.len() > 3;
+        if is_path {
             files.insert(w.to_string());
         }
     }
@@ -215,23 +221,13 @@ fn build_session_content(session: &SessionData) -> String {
 
 // ---- DB save ----
 
-fn save_to_db(session: &SessionData) -> Option<String> {
-    if session.session_id.is_empty() {
-        return None;
-    }
+/// Faz upsert da sessão num DB específico
+fn upsert_session_to_db(db_path: &PathBuf, mem_id: &str, content: &str, tags: &str) -> bool {
+    let conn = match storage::init_db(db_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
 
-    let mem_id = session_memory_id(&session.session_id);
-    let content = build_session_content(session);
-
-    // Auto-tag do conteúdo da sessão
-    let auto_tags = autotag::extract_tags(&content);
-    let base_tags = format!("conversation,claude-code,{},auto-saved", session.project);
-    let tags = autotag::merge_tags(&base_tags, &auto_tags);
-
-    let db_path = personality_db_path();
-    let conn = storage::init_db(&db_path).ok()?;
-
-    // Check se existe
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM memories WHERE id = ?",
@@ -246,14 +242,40 @@ fn save_to_db(session: &SessionData) -> Option<String> {
              updated_at = datetime('now'), embedding = NULL WHERE id = ?",
             rusqlite::params![content, tags, mem_id],
         )
-        .ok()?;
+        .is_ok()
     } else {
         conn.execute(
             "INSERT INTO memories (id, type, content, tags, importance) \
              VALUES (?, 'conversation', ?, ?, 0.3)",
             rusqlite::params![mem_id, content, tags],
         )
-        .ok()?;
+        .is_ok()
+    }
+}
+
+fn save_to_db(session: &SessionData) -> Option<String> {
+    if session.session_id.is_empty() {
+        return None;
+    }
+
+    let mem_id = session_memory_id(&session.session_id);
+    let content = build_session_content(session);
+
+    // Auto-tag do conteúdo da sessão
+    let auto_tags = autotag::extract_tags(&content);
+    let base_tags = format!("conversation,claude-code,{},auto-saved", session.project);
+    let tags = autotag::merge_tags(&base_tags, &auto_tags);
+
+    // 1. Salva no personality.db (sempre)
+    let personality_path = personality_db_path();
+    upsert_session_to_db(&personality_path, &mem_id, &content, &tags);
+
+    // 2. Salva no project.db (se cwd disponível)
+    if !session.cwd.is_empty() {
+        let project_db = std::path::Path::new(&session.cwd)
+            .join(".mcp-memoria")
+            .join("project.db");
+        upsert_session_to_db(&project_db, &mem_id, &content, &tags);
     }
 
     Some(mem_id)
@@ -280,6 +302,7 @@ fn handle_user_prompt(input: &HookInput) {
         session = SessionData {
             session_id: session_id.to_string(),
             project: project.clone(),
+            cwd: cwd.to_string(),
             ..Default::default()
         };
     }

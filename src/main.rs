@@ -273,11 +273,15 @@ impl MemoryServer {
     }
 
     fn queue_embedding(&self, db_path: &PathBuf, record_id: &str, content: &str) {
-        let _ = self.job_sender.try_send(EmbeddingJob {
+        let job = EmbeddingJob {
             db_path: db_path.to_string_lossy().to_string(),
             record_id: record_id.to_string(),
             content: content.to_string(),
-        });
+        };
+        // Tenta enviar; se o canal estiver cheio, loga warning em vez de perder silenciosamente
+        if let Err(e) = self.job_sender.try_send(job) {
+            tracing::warn!("Embedding queue full, job for {} dropped: {}", record_id, e);
+        }
     }
 
     fn resolve_save_db(&self, scope: &str) -> Option<PathBuf> {
@@ -435,6 +439,8 @@ impl MemoryServer {
         let dbs = storage::resolve_scope_dbs(&params.scope, &self.paths);
         let mut all_results = Vec::new();
 
+        // Busca mais do que o limite por scope para poder fazer merge+sort+truncate
+        let per_scope_limit = (params.limit * 2) as i64;
         for (scope_name, db_path) in dbs {
             if !db_path.exists() && scope_name == "project" {
                 continue;
@@ -446,7 +452,7 @@ impl MemoryServer {
             let mems = storage::list_memories(
                 &conn,
                 params.r#type.as_deref(),
-                params.limit as i64,
+                per_scope_limit,
             )
             .unwrap_or_default();
             for m in mems {
@@ -459,6 +465,10 @@ impl MemoryServer {
                 "No memories found.",
             )]));
         }
+
+        // Sort por created_at DESC e truncar ao limite global
+        all_results.sort_by(|a, b| b.1.created_at.cmp(&a.1.created_at));
+        all_results.truncate(params.limit);
 
         let mut output = format!("## Memories ({})\n\n", all_results.len());
         for (scope, r) in &all_results {
@@ -520,7 +530,7 @@ impl MemoryServer {
             }
         }
 
-        output.push_str("**Config v0.2**:\n");
+        output.push_str("**Config v0.3**:\n");
         output.push_str("- Embeddings: f16 compressed (50% less storage)\n");
         output.push_str("- Model: all-MiniLM-L6-v2\n");
         output.push_str("- Search: hybrid (vector=0.7, text=0.3) + importance boost + graph 1-hop\n");
@@ -734,11 +744,11 @@ impl ServerHandler for MemoryServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             instructions: Some(
-                "MCP Memory Server (Rust) v0.2 — Persistent memory for AI assistants. \
+                "MCP Memory Server (Rust) v0.3 — Persistent memory for AI assistants. \
                  Hybrid search (0.7 embedding + 0.3 BM25), temporal decay, \
                  Jaccard deduplication, chunking. 3 scopes: global, personality, project. \
-                 v0.2: auto-tagging, importance scoring, graph relations, f16 embeddings, \
-                 consolidation, TTL, cross-scope parallel search."
+                 v0.3: batch embeddings, auto-maintenance on startup, word-boundary auto-tags, \
+                 project-first consolidation, importance pre-filter on search, fixed temporal decay."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),
@@ -760,7 +770,7 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    info!("MCP Memory Server (Rust) v0.2 Starting...");
+    info!("MCP Memory Server (Rust) v0.3 Starting...");
 
     let paths = MemoryPaths::new();
     info!("Global DB: {}", paths.global_db.display());
@@ -782,6 +792,34 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Manutenção automática no startup: TTL + importance decay
+    let maintenance_personality = storage::compact_db(&conn_personality, "personality");
+    if let Ok(ref result) = maintenance_personality {
+        if result.ttl_applied > 0 || result.decayed > 0 {
+            info!(
+                "Auto-maintenance (personality): TTL={}, decayed={}",
+                result.ttl_applied, result.decayed
+            );
+        }
+    }
+    let maintenance_global = storage::compact_db(&conn_global, "global");
+    if let Ok(ref result) = maintenance_global {
+        if result.ttl_applied > 0 || result.decayed > 0 {
+            info!(
+                "Auto-maintenance (global): TTL={}, decayed={}",
+                result.ttl_applied, result.decayed
+            );
+        }
+    }
+
+    // Reindex: enfileirar memórias sem embedding para processamento
+    let unindexed_personality = storage::get_unindexed_memories(&conn_personality).unwrap_or_default();
+    let unindexed_global = storage::get_unindexed_memories(&conn_global).unwrap_or_default();
+    let total_unindexed = unindexed_personality.len() + unindexed_global.len();
+    if total_unindexed > 0 {
+        info!("Found {} unindexed memories, will queue after worker starts", total_unindexed);
+    }
+
     // Drop connections antes de iniciar server
     drop(conn_global);
     drop(conn_personality);
@@ -791,6 +829,25 @@ async fn main() -> Result<()> {
 
     // Background worker
     let job_sender = embedding::start_background_worker(engine.clone());
+
+    // Auto-reindex: enfileirar memórias sem embedding
+    for (id, content) in &unindexed_personality {
+        let _ = job_sender.try_send(EmbeddingJob {
+            db_path: paths.personality_db.to_string_lossy().to_string(),
+            record_id: id.clone(),
+            content: content.clone(),
+        });
+    }
+    for (id, content) in &unindexed_global {
+        let _ = job_sender.try_send(EmbeddingJob {
+            db_path: paths.global_db.to_string_lossy().to_string(),
+            record_id: id.clone(),
+            content: content.clone(),
+        });
+    }
+    if total_unindexed > 0 {
+        info!("Queued {} unindexed memories for background embedding", total_unindexed);
+    }
 
     let server = MemoryServer::new(paths, engine, job_sender);
 
@@ -806,7 +863,7 @@ async fn main() -> Result<()> {
         .inspect_err(|e| tracing::error!("Erro ao iniciar server: {:?}", e))
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
-    info!("MCP server v0.2 rodando via stdio");
+    info!("MCP server v0.3 rodando via stdio");
     service.waiting().await?;
 
     Ok(())

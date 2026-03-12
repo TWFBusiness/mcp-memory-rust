@@ -59,7 +59,7 @@ fn parse_days_old(created_at: &str) -> i64 {
     0
 }
 
-/// Busca FTS5 com scores BM25 normalizados
+/// Busca FTS5 com scores BM25 normalizados (sem temporal decay — aplicado só no merge)
 pub fn search_fts(conn: &Connection, query: &str, limit: usize) -> Vec<SearchResult> {
     let tokens: Vec<&str> = query.split_whitespace().filter(|t| !t.is_empty()).collect();
     if tokens.is_empty() {
@@ -91,7 +91,8 @@ pub fn search_fts(conn: &Connection, query: &str, limit: usize) -> Vec<SearchRes
         let bm25_normalized = bm25_raw / (bm25_raw + 1.0);
         let created_at: String = row.get::<_, Option<String>>(4)?.unwrap_or_default();
         let importance: f64 = row.get::<_, Option<f64>>(6)?.unwrap_or(0.5);
-        let score = apply_temporal_decay(bm25_normalized, &created_at) * importance;
+        // Score sem temporal decay (será aplicado uma única vez no merge)
+        let score = bm25_normalized * importance;
 
         Ok(SearchResult {
             id: row.get(0)?,
@@ -110,23 +111,26 @@ pub fn search_fts(conn: &Connection, query: &str, limit: usize) -> Vec<SearchRes
     rows.flatten().collect()
 }
 
-/// Busca por embedding: scan linear (memórias + chunks) com importance boost
+/// Busca por embedding com pré-filtro por importância (sem temporal decay — aplicado no merge).
+/// Exclui conversations de baixa importância para reduzir scan.
 pub fn search_embedding(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
 ) -> Vec<SearchResult> {
     const MIN_SIM: f64 = 0.3;
+    const MIN_IMPORTANCE: f64 = 0.2;
 
     let mut results_map: std::collections::HashMap<String, SearchResult> =
         std::collections::HashMap::new();
 
-    // Busca nos embeddings principais
+    // Pré-filtro: exclui memórias com importância muito baixa (conversations não acessadas)
     if let Ok(mut stmt) = conn.prepare(
         "SELECT id, type, content, tags, created_at, embedding, importance \
-         FROM memories WHERE embedding IS NOT NULL AND archived = 0",
+         FROM memories WHERE embedding IS NOT NULL AND archived = 0 \
+         AND importance >= ?1",
     ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE], |row| {
             let id: String = row.get(0)?;
             let mem_type: String = row.get(1)?;
             let content: String = row.get(2)?;
@@ -140,7 +144,8 @@ pub fn search_embedding(
                 let stored = bytes_to_f32(&r.5);
                 let sim = cosine_similarity(query_embedding, &stored);
                 if sim > MIN_SIM {
-                    let score = apply_temporal_decay(sim, &r.4) * r.6;
+                    // Score sem temporal decay (será aplicado uma única vez no merge)
+                    let score = sim * r.6;
                     let entry = results_map.entry(r.0.clone()).or_insert(SearchResult {
                         id: r.0,
                         mem_type: r.1,
@@ -158,13 +163,14 @@ pub fn search_embedding(
         }
     }
 
-    // Busca nos chunks
+    // Busca nos chunks (com pré-filtro)
     if let Ok(mut stmt) = conn.prepare(
         "SELECT c.memory_id, c.embedding, m.type, m.content, m.tags, m.created_at, m.importance \
          FROM memory_chunks c JOIN memories m ON c.memory_id = m.id \
-         WHERE c.embedding IS NOT NULL AND m.archived = 0",
+         WHERE c.embedding IS NOT NULL AND m.archived = 0 \
+         AND m.importance >= ?1",
     ) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE], |row| {
             let mem_id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             let mem_type: String = row.get(2)?;
@@ -178,7 +184,7 @@ pub fn search_embedding(
                 let stored = bytes_to_f32(&r.1);
                 let sim = cosine_similarity(query_embedding, &stored);
                 if sim > MIN_SIM {
-                    let score = apply_temporal_decay(sim, &r.5) * r.6;
+                    let score = sim * r.6;
                     let entry = results_map.entry(r.0.clone()).or_insert(SearchResult {
                         id: r.0,
                         mem_type: r.2,

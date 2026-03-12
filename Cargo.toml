@@ -1,6 +1,6 @@
 [package]
 name = "mcp-memory-rust"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "High-performance MCP Memory Server in Rust — persistent memory for AI assistants"
 license = "MIT"

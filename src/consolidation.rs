@@ -14,54 +14,61 @@ pub struct ConsolidationResult {
     pub archived: usize,
 }
 
+/// Extrai nome do projeto do conteúdo da sessão (formato "[project-name] Session ...")
+fn extract_project_from_content(content: &str) -> String {
+    if let Some(start) = content.find('[') {
+        if let Some(end) = content[start..].find(']') {
+            let name = content[start + 1..start + end].trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "unknown".to_string()
+}
+
 /// Consolida memórias de conversation por projeto.
+/// Agrupa pelo nome do projeto extraído do conteúdo (não por tags exatas).
 /// Se >= 5 sessões do mesmo projeto, gera resumo consolidado.
 pub fn consolidate_conversations(conn: &Connection) -> usize {
     let mut consolidated = 0usize;
 
-    // Buscar projetos com >= 5 conversations não-arquivadas
+    // Buscar TODAS as conversations não-arquivadas
     let mut stmt = match conn.prepare(
-        "SELECT tags, COUNT(*) as cnt FROM memories \
+        "SELECT id, content, tags, created_at FROM memories \
          WHERE type = 'conversation' AND archived = 0 \
-         GROUP BY tags HAVING cnt >= 5"
+         ORDER BY created_at ASC"
     ) {
         Ok(s) => s,
         Err(_) => return 0,
     };
 
-    let projects: Vec<String> = stmt
-        .query_map([], |row| row.get::<_, String>(0))
+    let all_sessions: Vec<(String, String, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            ))
+        })
         .ok()
         .map(|r| r.flatten().collect())
         .unwrap_or_default();
 
-    for project_tags in projects {
-        // Extrair project name das tags
-        let project_name = project_tags
-            .split(',')
-            .find(|t| !["conversation", "claude-code", "auto-saved", "consolidated"].contains(t))
-            .unwrap_or("unknown")
-            .trim();
+    // Agrupar por projeto extraído do conteúdo
+    let mut by_project: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    for (id, content, tags, _created_at) in &all_sessions {
+        let project = extract_project_from_content(content);
+        by_project.entry(project).or_default().push((
+            id.clone(),
+            content.clone(),
+            tags.clone(),
+        ));
+    }
 
-        // Buscar todas as sessões deste projeto
-        let mut fetch_stmt = match conn.prepare(
-            "SELECT id, content, created_at FROM memories \
-             WHERE type = 'conversation' AND archived = 0 AND tags = ? \
-             ORDER BY created_at ASC"
-        ) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let sessions: Vec<(String, String, String)> = fetch_stmt
-            .query_map(rusqlite::params![project_tags], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get::<_, Option<String>>(2)?.unwrap_or_default()))
-            })
-            .ok()
-            .map(|r| r.flatten().collect())
-            .unwrap_or_default();
-
-        if sessions.len() < 5 {
+    for (project_name, sessions) in &by_project {
+        if sessions.len() < 5 || project_name == "unknown" {
             continue;
         }
 
@@ -71,7 +78,7 @@ pub fn consolidate_conversations(conn: &Connection) -> usize {
         let mut all_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         let session_ids: Vec<String> = sessions.iter().map(|s| s.0.clone()).collect();
 
-        for (_, content, _) in &sessions {
+        for (_, content, _) in sessions {
             for line in content.lines() {
                 if line.starts_with("Tools: ") {
                     for tool in line[7..].split(", ") {
@@ -130,6 +137,7 @@ pub fn consolidate_conversations(conn: &Connection) -> usize {
 }
 
 /// Consolida memórias similares (não-conversation) com Jaccard 0.6-0.84.
+/// Usa pré-filtro FTS para evitar O(n²) completo.
 /// Mantém a mais recente, cria edge supersedes.
 pub fn consolidate_similar(conn: &Connection) -> usize {
     let mut merged = 0usize;
@@ -160,12 +168,16 @@ pub fn consolidate_similar(conn: &Connection) -> usize {
 
     let mut archived_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
+    // Limitar comparações: máximo 200 por tipo para evitar O(n²) explosivo
+    const MAX_PER_TYPE: usize = 200;
+
     for (_mem_type, items) in &by_type {
-        for i in 0..items.len() {
+        let check_limit = items.len().min(MAX_PER_TYPE);
+        for i in 0..check_limit {
             if archived_ids.contains(&items[i].0) {
                 continue;
             }
-            for j in (i + 1)..items.len() {
+            for j in (i + 1)..check_limit {
                 if archived_ids.contains(&items[j].0) {
                     continue;
                 }

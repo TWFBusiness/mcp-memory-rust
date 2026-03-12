@@ -95,23 +95,49 @@ const EXT_MAP: &[(&str, &str)] = &[
     (".ex", "elixir"), (".exs", "elixir"), (".dart", "dart"),
 ];
 
+/// Checa se keyword aparece como palavra inteira (word boundary)
+fn has_word(words: &HashSet<&str>, keyword: &str) -> bool {
+    // Keyword simples (sem espaço): check direto no set de palavras
+    if !keyword.contains(' ') {
+        return words.contains(keyword);
+    }
+    // Keyword composta (ex: "github actions"): check se contém no texto via contains
+    // Neste caso, false positivos são raros, então mantemos contains
+    false
+}
+
+/// Checa keyword composta no texto original (para termos com espaço)
+fn has_compound_keyword(lower: &str, keyword: &str) -> bool {
+    if !keyword.contains(' ') {
+        return false;
+    }
+    lower.contains(keyword)
+}
+
 /// Extrai tags automaticamente do conteúdo.
 /// Retorna Vec<String> com tags únicas, ordenadas, máximo 15.
+/// Usa word boundary para evitar falsos positivos (ex: "rest" não matcha "interest").
 pub fn extract_tags(content: &str) -> Vec<String> {
     let mut tags = HashSet::new();
     let lower = content.to_lowercase();
 
-    // 1. Tecnologias
+    // Tokenizar em palavras para word boundary matching
+    let words: HashSet<&str> = lower
+        .split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#' && c != '-' && c != '.')
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    // 1. Tecnologias (word boundary)
     for (keyword, tag) in TECH_KEYWORDS {
-        if lower.contains(keyword) {
+        if has_word(&words, keyword) || has_compound_keyword(&lower, keyword) {
             tags.insert(tag.to_string());
         }
     }
 
-    // 2. Ações
+    // 2. Ações (word boundary)
     for (keywords, tag) in ACTION_PATTERNS {
         for kw in *keywords {
-            if lower.contains(kw) {
+            if has_word(&words, kw) {
                 tags.insert(tag.to_string());
                 break;
             }
