@@ -123,13 +123,55 @@ Edite `~/.claude/settings.json`:
 ```
 
 O hook captura automaticamente:
-- **UserPromptSubmit**: acumula a pergunta do usuário na sessão
-- **Stop**: salva a sessão completa no `personality.db` (UPSERT — uma memória por sessão)
+- **UserPromptSubmit**: acumula a pergunta do usuário e **salva no DB imediatamente** (não espera o fim da sessão)
+- **Stop**: atualiza a sessão com resposta do assistente e tools usadas, salva no DB
 - Extrai: tools usadas, arquivos mencionados, tópicos da conversa
+- UPSERT por sessão — uma memória por sessão, atualizada a cada interação
 - Executa em **<10ms** e usa **6 MB de RAM** (sem carregar modelo de embedding)
 - Os embeddings são gerados depois pelo background worker do servidor MCP
 
 > **Nota**: O hook é exclusivo para Claude Code. Cursor e Codex não possuem sistema de hooks — nesses IDEs, use apenas o servidor MCP e instrua o assistente a chamar `memory_save` nas instruções do projeto.
+
+**3. Instruções no CLAUDE.md global** (prioridade de escopos):
+
+Adicione no seu `~/.claude/CLAUDE.md` as instruções de como o assistente deve usar os escopos de memória. **O escopo padrão deve ser `project`**, não `personality`:
+
+```markdown
+## Memory System (MCP Memory)
+
+### Regra de escopo — PRIORIDADE:
+- `scope="project"` → **DEFAULT** para tudo relacionado ao projeto atual (decisões, implementações, bugs, arquitetura, soluções)
+- `scope="personality"` → Apenas para preferências pessoais e padrões cross-project que NÃO são específicos de um projeto
+- `scope="global"` → Apenas quando o usuário pedir explicitamente "salve globalmente" ou "lembre sempre"
+
+### Ao salvar:
+- Dentro de um projeto → SEMPRE `scope="project"`
+- Preferência pessoal / cross-project → `scope="personality"`
+- Padrão universal permanente → `scope="global"` (só quando pedido)
+
+### Ao buscar (ordem de prioridade):
+1. Primeiro: `memory_search(query="...", scope="project")`
+2. Depois: `memory_search(query="...", scope="global")` — só se relevante
+3. Por último: `scope="personality"` — só se precisar de preferências cross-project
+4. **NUNCA usar `scope="all"` por padrão** — só quando project+global não retornar resultado útil
+
+### Formato de save:
+memory_save(
+    content="<descrição detalhada>",
+    type="decision|solution|implementation|architecture|note",
+    scope="project",  # DEFAULT quando dentro de um projeto
+    tags="<project-name>,<stack>,<contexto>"
+)
+
+### O que salvar automaticamente:
+- Qualquer arquivo editado ou criado
+- Qualquer bug corrigido
+- Qualquer feature implementada
+- Qualquer decisão de arquitetura
+- Descoberta de como o código funciona
+- Configuração definida
+- Workaround encontrado
+```
 
 #### Cursor
 
@@ -160,7 +202,7 @@ Ou edite `.cursor/mcp.json` no projeto:
 Para salvar conversas automaticamente no Cursor, adicione nas instruções do projeto (`.cursorrules`):
 
 ```
-Após cada resposta substantiva, chame memory_save com scope="personality" para salvar decisões, implementações e soluções relevantes.
+Após cada resposta substantiva, chame memory_save com scope="project" para salvar decisões, implementações e soluções relevantes do projeto. Use scope="personality" apenas para preferências pessoais cross-project.
 ```
 
 #### OpenAI Codex CLI
@@ -178,7 +220,7 @@ export MCP_SERVERS='{"memory-rust":{"command":"/caminho/para/mcp-memory-rust"}}'
 Para salvar conversas automaticamente no Codex, adicione nas instruções do projeto (`AGENTS.md` ou `codex.md`):
 
 ```
-Após cada resposta substantiva, chame memory_save com scope="personality" para salvar decisões, implementações e soluções relevantes.
+Após cada resposta substantiva, chame memory_save com scope="project" para salvar decisões, implementações e soluções relevantes do projeto. Use scope="personality" apenas para preferências pessoais cross-project.
 ```
 
 ### Tools disponíveis
@@ -318,13 +360,55 @@ Edit `~/.claude/settings.json`:
 ```
 
 The hook automatically captures:
-- **UserPromptSubmit**: accumulates the user's prompt in the session
-- **Stop**: saves the full session to `personality.db` (UPSERT — one memory per session)
+- **UserPromptSubmit**: accumulates the user's prompt and **saves to DB immediately** (doesn't wait for session end)
+- **Stop**: updates session with assistant response and tools used, saves to DB
 - Extracts: tools used, files mentioned, conversation topics
+- UPSERT per session — one memory per session, updated on every interaction
 - Runs in **<10ms** using **6 MB RAM** (no embedding model loaded)
 - Embeddings are generated later by the MCP server's background worker
 
 > **Note**: The hook is exclusive to Claude Code. Cursor and Codex don't have a hooks system — for those IDEs, use only the MCP server and instruct the assistant to call `memory_save` in your project instructions.
+
+**3. CLAUDE.md global instructions** (scope priority):
+
+Add to your `~/.claude/CLAUDE.md` instructions for how the assistant should use memory scopes. **The default scope should be `project`**, not `personality`:
+
+```markdown
+## Memory System (MCP Memory)
+
+### Scope priority:
+- `scope="project"` → **DEFAULT** for everything related to the current project (decisions, implementations, bugs, architecture, solutions)
+- `scope="personality"` → Only for personal preferences and cross-project patterns that are NOT project-specific
+- `scope="global"` → Only when the user explicitly says "save globally" or "remember always"
+
+### When saving:
+- Inside a project → ALWAYS `scope="project"`
+- Personal preference / cross-project → `scope="personality"`
+- Universal permanent pattern → `scope="global"` (only when asked)
+
+### When searching (priority order):
+1. First: `memory_search(query="...", scope="project")`
+2. Then: `memory_search(query="...", scope="global")` — only if relevant
+3. Last: `scope="personality"` — only if cross-project preferences are needed
+4. **NEVER use `scope="all"` by default** — only when project+global returns no useful results
+
+### Save format:
+memory_save(
+    content="<detailed description>",
+    type="decision|solution|implementation|architecture|note",
+    scope="project",  # DEFAULT when inside a project
+    tags="<project-name>,<stack>,<context>"
+)
+
+### What to auto-save:
+- Any file edited or created
+- Any bug fixed
+- Any feature implemented
+- Any architecture decision
+- Discovery of how code works
+- Configuration defined
+- Workaround found
+```
 
 #### Cursor
 
@@ -355,7 +439,7 @@ Or edit `.cursor/mcp.json` in your project:
 To auto-save conversations in Cursor, add to your project instructions (`.cursorrules`):
 
 ```
-After every substantive response, call memory_save with scope="personality" to save relevant decisions, implementations, and solutions.
+After every substantive response, call memory_save with scope="project" to save relevant project decisions, implementations, and solutions. Use scope="personality" only for personal cross-project preferences.
 ```
 
 #### OpenAI Codex CLI
@@ -373,7 +457,7 @@ export MCP_SERVERS='{"memory-rust":{"command":"/path/to/mcp-memory-rust"}}'
 To auto-save conversations in Codex, add to your project instructions (`AGENTS.md` or `codex.md`):
 
 ```
-After every substantive response, call memory_save with scope="personality" to save relevant decisions, implementations, and solutions.
+After every substantive response, call memory_save with scope="project" to save relevant project decisions, implementations, and solutions. Use scope="personality" only for personal cross-project preferences.
 ```
 
 ### Available tools

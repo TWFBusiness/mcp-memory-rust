@@ -306,9 +306,13 @@ fn handle_user_prompt(input: &HookInput) {
     }
 
     save_session(&session);
+
+    // Salva no DB a cada prompt (não espera o Stop)
+    let mem_id = save_to_db(&session);
     eprintln!(
-        "[Memory Hook] Captured user prompt ({} chars)",
-        prompt.len()
+        "[Memory Hook] Captured user prompt ({} chars), saved to DB: {}",
+        prompt.len(),
+        mem_id.as_deref().unwrap_or("none")
     );
 }
 
