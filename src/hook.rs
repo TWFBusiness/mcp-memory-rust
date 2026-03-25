@@ -9,16 +9,21 @@
 /// Salva em personality.db (sempre) e project.db (se cwd disponível).
 use std::collections::HashSet;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod autotag;
+#[allow(dead_code)]
 mod chunking;
+#[allow(dead_code)]
 mod dedup;
+#[allow(dead_code)]
 mod embedding;
+#[allow(dead_code)]
 mod search;
+#[allow(dead_code)]
 mod storage;
 
 const MAX_TURNS: usize = 20;
@@ -222,7 +227,7 @@ fn build_session_content(session: &SessionData) -> String {
 // ---- DB save ----
 
 /// Faz upsert da sessão num DB específico
-fn upsert_session_to_db(db_path: &PathBuf, mem_id: &str, content: &str, tags: &str) -> bool {
+fn upsert_session_to_db(db_path: &Path, mem_id: &str, content: &str, tags: &str) -> bool {
     let conn = match storage::init_db(db_path) {
         Ok(c) => c,
         Err(_) => return false,

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use anyhow::Result;
-use fastembed::{TextEmbedding, InitOptions, EmbeddingModel};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use half::f16;
 use rusqlite::Connection;
 use sha2::{Sha256, Digest};
@@ -9,7 +9,8 @@ use tracing::{info, warn};
 
 /// Wrapper para fastembed TextEmbedding (thread-safe via Mutex)
 pub struct EmbeddingEngine {
-    model: std::sync::Mutex<TextEmbedding>,
+    model_type: EmbeddingModel,
+    model: std::sync::Mutex<Option<TextEmbedding>>,
 }
 
 impl EmbeddingEngine {
@@ -18,24 +19,38 @@ impl EmbeddingEngine {
     }
 
     pub fn with_model(model_type: EmbeddingModel) -> Result<Self> {
-        info!("Carregando modelo de embedding ({:?})...", model_type);
-        let model = TextEmbedding::try_new(
-            InitOptions::new(model_type).with_show_download_progress(true),
-        )?;
-        info!("Modelo de embedding carregado");
-        Ok(Self { model: std::sync::Mutex::new(model) })
+        Ok(Self {
+            model_type,
+            model: std::sync::Mutex::new(None),
+        })
+    }
+
+    fn with_model_lock<T>(&self, f: impl FnOnce(&mut TextEmbedding) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .model
+            .lock()
+            .map_err(|e| anyhow::anyhow!("lock: {}", e))?;
+        if guard.is_none() {
+            info!("Carregando modelo de embedding ({:?})...", self.model_type);
+            let model = TextEmbedding::try_new(
+                InitOptions::new(self.model_type.clone()).with_show_download_progress(true),
+            )?;
+            info!("Modelo de embedding carregado");
+            *guard = Some(model);
+        }
+        let model = guard
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("embedding model unavailable"))?;
+        f(model)
     }
 
     pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let mut model = self.model.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
-        let results = model.embed(vec![text.to_string()], None)?;
+        let results = self.with_model_lock(|model| model.embed(vec![text.to_string()], None))?;
         Ok(results.into_iter().next().unwrap_or_default())
     }
 
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut model = self.model.lock().map_err(|e| anyhow::anyhow!("lock: {}", e))?;
-        let results = model.embed(texts.to_vec(), None)?;
-        Ok(results)
+        self.with_model_lock(|model| model.embed(texts, None))
     }
 }
 
@@ -56,11 +71,6 @@ pub fn decompress_embedding(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// Converte f32 para bytes (formato legado, 4 bytes por float)
-pub fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|f| f.to_le_bytes()).collect()
-}
-
 /// Lê bytes e detecta automaticamente formato (f16 ou f32) baseado no tamanho
 /// 384 dims: f16 = 768 bytes, f32 = 1536 bytes
 pub fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
@@ -77,7 +87,7 @@ pub fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     }
 
     // Fallback: assume f32 se divisível por 4
-    if bytes.len() % 4 == 0 && possible_f32_dims > 0 {
+    if bytes.len().is_multiple_of(4) && possible_f32_dims > 0 {
         return bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -85,7 +95,7 @@ pub fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     }
 
     // Tenta f16 como último recurso
-    if bytes.len() % 2 == 0 {
+    if bytes.len().is_multiple_of(2) {
         return decompress_embedding(bytes);
     }
 

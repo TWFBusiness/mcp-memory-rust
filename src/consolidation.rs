@@ -80,16 +80,16 @@ pub fn consolidate_conversations(conn: &Connection) -> usize {
 
         for (_, content, _) in sessions {
             for line in content.lines() {
-                if line.starts_with("Tools: ") {
-                    for tool in line[7..].split(", ") {
+                if let Some(stripped) = line.strip_prefix("Tools: ") {
+                    for tool in stripped.split(", ") {
                         all_tools.insert(tool.trim().to_string());
                     }
-                } else if line.starts_with("Files: ") {
-                    for file in line[7..].split(", ") {
+                } else if let Some(stripped) = line.strip_prefix("Files: ") {
+                    for file in stripped.split(", ") {
                         all_files.insert(file.trim().to_string());
                     }
-                } else if line.starts_with("  - ") {
-                    let topic = line[4..].trim();
+                } else if let Some(stripped) = line.strip_prefix("  - ") {
+                    let topic = stripped.trim();
                     if !topic.is_empty() && all_topics.len() < 30 {
                         all_topics.push(topic.to_string());
                     }
@@ -127,7 +127,7 @@ pub fn consolidate_conversations(conn: &Connection) -> usize {
                 "UPDATE memories SET archived = 1 WHERE id = ?",
                 rusqlite::params![session_id],
             );
-            storage::create_edge(conn, &consolidated_id, session_id, "supersedes");
+            let _ = storage::create_edge(conn, &consolidated_id, session_id, "supersedes");
         }
 
         consolidated += 1;
@@ -171,7 +171,7 @@ pub fn consolidate_similar(conn: &Connection) -> usize {
     // Limitar comparações: máximo 200 por tipo para evitar O(n²) explosivo
     const MAX_PER_TYPE: usize = 200;
 
-    for (_mem_type, items) in &by_type {
+    for items in by_type.values() {
         let check_limit = items.len().min(MAX_PER_TYPE);
         for i in 0..check_limit {
             if archived_ids.contains(&items[i].0) {
@@ -182,9 +182,9 @@ pub fn consolidate_similar(conn: &Connection) -> usize {
                     continue;
                 }
                 let sim = jaccard_sim(&items[i].1, &items[j].1);
-                if sim >= 0.6 && sim < 0.85 {
+                if (0.6..0.85).contains(&sim) {
                     // i é mais recente (sorted DESC), criar edge supersedes
-                    storage::create_edge(conn, &items[i].0, &items[j].0, "supersedes");
+                    let _ = storage::create_edge(conn, &items[i].0, &items[j].0, "supersedes");
 
                     // Merge content: append unique info do mais antigo ao mais recente
                     let merged_content = format!("{}\n\n[Merged from {}]: {}",

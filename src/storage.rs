@@ -11,20 +11,25 @@ pub struct MemoryPaths {
 }
 
 impl MemoryPaths {
-    pub fn new() -> Self {
-        let home = dirs::home_dir().expect("home dir not found");
+    pub fn new() -> Result<Self> {
+        let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not found"))?;
         let data_dir = home.join(".mcp-memoria").join("data");
-        Self {
+        Ok(Self {
             global_db: data_dir.join("global.db"),
             personality_db: data_dir.join("personality.db"),
             data_dir,
-        }
+        })
     }
 
     pub fn project_db_path() -> Option<PathBuf> {
         let cwd = std::env::var("MCP_PROJECT_DIR")
             .or_else(|_| std::env::var("CLAUDE_CWD"))
-            .unwrap_or_else(|_| std::env::current_dir().unwrap().to_string_lossy().to_string());
+            .ok()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })?;
         Some(Path::new(&cwd).join(".mcp-memoria").join("project.db"))
     }
 }
@@ -281,7 +286,7 @@ pub fn save_memory(
                  VALUES (?, ?, ?, ?, datetime('now'), ?)",
                 rusqlite::params![mem_id, mem_type, content, final_tags, importance],
             )?;
-            create_edge(conn, &mem_id, &related_id, "relates_to");
+            let _ = create_edge(conn, &mem_id, &related_id, "relates_to");
             return Ok(SaveResult {
                 id: mem_id,
                 dedup: "new".into(),
@@ -308,11 +313,12 @@ pub struct SaveResult {
 }
 
 /// Cria edge entre duas memórias
-pub fn create_edge(conn: &Connection, from_id: &str, to_id: &str, relation: &str) {
-    let _ = conn.execute(
+pub fn create_edge(conn: &Connection, from_id: &str, to_id: &str, relation: &str) -> Result<bool> {
+    let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_edges (from_id, to_id, relation) VALUES (?, ?, ?)",
         rusqlite::params![from_id, to_id, relation],
-    );
+    )?;
+    Ok(inserted > 0)
 }
 
 /// Incrementa access_count e atualiza importance
@@ -484,13 +490,10 @@ pub fn get_unindexed_memories(conn: &Connection) -> Result<Vec<(String, String)>
 
 /// Compact: VACUUM + rebuild FTS + apply TTL
 pub fn compact_db(conn: &Connection, scope: &str) -> Result<CompactResult> {
-    let mut result = CompactResult::default();
-
-    // Apply TTL
-    result.ttl_applied = apply_ttl(conn, scope);
-
-    // Apply importance decay para memórias antigas não acessadas
-    result.decayed = apply_importance_decay(conn);
+    let result = CompactResult {
+        ttl_applied: apply_ttl(conn, scope),
+        decayed: apply_importance_decay(conn),
+    };
 
     // Rebuild FTS
     let _ = conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');");
@@ -521,25 +524,23 @@ pub fn apply_ttl(conn: &Connection, scope: &str) -> i64 {
         "global" => 0, // sem expiração
         "personality" => {
             // Arquivar conversations antigas (> N dias), manter decisions/patterns
-            let archived = conn.execute(
+            conn.execute(
                 "UPDATE memories SET archived = 1 \
                  WHERE type = 'conversation' AND archived = 0 \
                  AND julianday('now') - julianday(updated_at) > ? \
                  AND access_count = 0",
                 rusqlite::params![personality_days],
-            ).unwrap_or(0) as i64;
-            archived
+            ).unwrap_or(0) as i64
         }
         "project" => {
             // Reduzir importance de memórias stale (> N dias sem acesso)
-            let stale = conn.execute(
+            conn.execute(
                 "UPDATE memories SET importance = importance * 0.5 \
                  WHERE archived = 0 AND access_count = 0 \
                  AND julianday('now') - julianday(updated_at) > ? \
                  AND importance > 0.1",
                 rusqlite::params![project_days],
-            ).unwrap_or(0) as i64;
-            stale
+            ).unwrap_or(0) as i64
         }
         _ => 0,
     }

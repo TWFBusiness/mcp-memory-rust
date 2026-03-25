@@ -1,7 +1,7 @@
-/// Auto-tagging inteligente: extrai tags do conteúdo automaticamente.
-/// - Tecnologias: regex match contra ~100 termos conhecidos
-/// - Tipo de ação: detect keywords (fix/bug → bugfix, implement → feature, etc)
-/// - Paths/arquivos: extrai extensões de arquivo
+//! Auto-tagging inteligente: extrai tags do conteúdo automaticamente.
+//! - Tecnologias: regex match contra ~100 termos conhecidos
+//! - Tipo de ação: detect keywords (fix/bug → bugfix, implement → feature, etc)
+//! - Paths/arquivos: extrai extensões de arquivo
 
 use std::collections::HashSet;
 

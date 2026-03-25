@@ -6,7 +6,7 @@ mod embedding;
 mod search;
 mod storage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -233,55 +233,17 @@ impl MemoryServer {
         all_results
     }
 
-    /// Sync version for tools that need it
-    fn do_search(
-        &self,
-        query: &str,
-        scope: &str,
-        limit: usize,
-    ) -> Vec<(String, search::SearchResult)> {
-        let dbs = storage::resolve_scope_dbs(scope, &self.paths);
-        let mut all_results = Vec::new();
-
-        let query_emb = self.embedding_engine.embed(query).ok();
-
-        for (scope_name, db_path) in dbs {
-            if !db_path.exists() && scope_name == "project" {
-                continue;
-            }
-            let conn = match storage::init_db(&db_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let results = search::search_hybrid(
-                &conn,
-                query,
-                query_emb.as_deref(),
-                limit,
-            );
-            let weight = scope_weight(&scope_name);
-            for mut r in results {
-                r.relevance *= weight;
-                r.relevance = (r.relevance * 10000.0).round() / 10000.0;
-                all_results.push((scope_name.clone(), r));
-            }
-        }
-
-        all_results.sort_by(|a, b| b.1.relevance.partial_cmp(&a.1.relevance).unwrap());
-        all_results.truncate(limit);
-        all_results
-    }
-
-    fn queue_embedding(&self, db_path: &PathBuf, record_id: &str, content: &str) {
+    fn queue_embedding(&self, db_path: &Path, record_id: &str, content: &str) -> bool {
         let job = EmbeddingJob {
             db_path: db_path.to_string_lossy().to_string(),
             record_id: record_id.to_string(),
             content: content.to_string(),
         };
-        // Tenta enviar; se o canal estiver cheio, loga warning em vez de perder silenciosamente
         if let Err(e) = self.job_sender.try_send(job) {
             tracing::warn!("Embedding queue full, job for {} dropped: {}", record_id, e);
+            return false;
         }
+        true
     }
 
     fn resolve_save_db(&self, scope: &str) -> Option<PathBuf> {
@@ -300,7 +262,7 @@ impl MemoryServer {
         &self,
         Parameters(params): Parameters<ContextParams>,
     ) -> Result<CallToolResult, McpError> {
-        let results = self.do_search_parallel(params.query, "all".into(), 8).await;
+        let results = self.do_search_parallel(params.query, "both".into(), 8).await;
 
         if results.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -410,17 +372,23 @@ impl MemoryServer {
 
         match storage::save_memory(&conn, &params.r#type, &params.content, &tags) {
             Ok(result) => {
-                self.queue_embedding(&db_path, &result.id, &params.content);
+                let queued = self.queue_embedding(&db_path, &result.id, &params.content);
                 let dedup_info = if result.dedup == "updated" {
                     "\n- Dedup: updated existing (similar found)"
                 } else {
                     ""
                 };
+                let embedding_info = if queued {
+                    "queued (f16 compressed)"
+                } else {
+                    "not queued: worker queue full"
+                };
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Memory saved ({})\n- Type: {}\n- ID: {}\n- Tags: auto-enriched\n- Embedding: queued (f16 compressed){}",
+                    "Memory saved ({})\n- Type: {}\n- ID: {}\n- Tags: auto-enriched\n- Embedding: {}{}",
                     params.scope,
                     params.r#type,
                     result.id,
+                    embedding_info,
                     dedup_info
                 ))]))
             }
@@ -600,6 +568,7 @@ impl MemoryServer {
     ) -> Result<CallToolResult, McpError> {
         let dbs = storage::resolve_scope_dbs(&params.scope, &self.paths);
         let mut total = 0usize;
+        let mut dropped = 0usize;
         let mut details = Vec::new();
 
         for (scope_name, db_path) in dbs {
@@ -612,16 +581,22 @@ impl MemoryServer {
             };
             let unindexed = storage::get_unindexed_memories(&conn).unwrap_or_default();
             let count = unindexed.len();
+            let mut queued_here = 0usize;
             for (id, content) in unindexed {
-                self.queue_embedding(&db_path, &id, &content);
+                if self.queue_embedding(&db_path, &id, &content) {
+                    queued_here += 1;
+                } else {
+                    dropped += 1;
+                }
             }
             total += count;
-            details.push(format!("- {}: {} queued", scope_name, count));
+            details.push(format!("- {}: {} queued, {} dropped", scope_name, queued_here, count.saturating_sub(queued_here)));
         }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "## Reindex Started\n\nQueued {} memories for embedding (f16).\n{}\n\nWorker processing in background.",
+            "## Reindex Started\n\nQueued {} memories for embedding (f16).\n- Dropped: {}\n{}\n\nWorker processing in background.",
             total,
+            dropped,
             details.join("\n")
         ))]))
     }
@@ -730,12 +705,20 @@ impl MemoryServer {
             }
         };
 
-        storage::create_edge(&conn, &params.from_id, &params.to_id, &params.relation);
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Link created: {} --[{}]--> {}",
-            params.from_id, params.relation, params.to_id
-        ))]))
+        match storage::create_edge(&conn, &params.from_id, &params.to_id, &params.relation) {
+            Ok(true) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Link created: {} --[{}]--> {}",
+                params.from_id, params.relation, params.to_id
+            ))])),
+            Ok(false) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Link already exists: {} --[{}]--> {}",
+                params.from_id, params.relation, params.to_id
+            ))])),
+            Err(e) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Error creating link: {}",
+                e
+            ))])),
+        }
     }
 }
 
@@ -772,45 +755,13 @@ async fn main() -> Result<()> {
 
     info!("MCP Memory Server (Rust) v0.3 Starting...");
 
-    let paths = MemoryPaths::new();
+    let paths = MemoryPaths::new()?;
     info!("Global DB: {}", paths.global_db.display());
     info!("Personality DB: {}", paths.personality_db.display());
 
     // Inicializa DBs com novo schema
     let conn_global = storage::init_db(&paths.global_db)?;
     let conn_personality = storage::init_db(&paths.personality_db)?;
-
-    // Migrar embeddings f32 → f16 em background
-    let migrated_global = embedding::migrate_embeddings_to_f16(&conn_global);
-    let migrated_personality = embedding::migrate_embeddings_to_f16(&conn_personality);
-    if migrated_global + migrated_personality > 0 {
-        info!(
-            "Migrated {} embeddings to f16 (global: {}, personality: {})",
-            migrated_global + migrated_personality,
-            migrated_global,
-            migrated_personality
-        );
-    }
-
-    // Manutenção automática no startup: TTL + importance decay
-    let maintenance_personality = storage::compact_db(&conn_personality, "personality");
-    if let Ok(ref result) = maintenance_personality {
-        if result.ttl_applied > 0 || result.decayed > 0 {
-            info!(
-                "Auto-maintenance (personality): TTL={}, decayed={}",
-                result.ttl_applied, result.decayed
-            );
-        }
-    }
-    let maintenance_global = storage::compact_db(&conn_global, "global");
-    if let Ok(ref result) = maintenance_global {
-        if result.ttl_applied > 0 || result.decayed > 0 {
-            info!(
-                "Auto-maintenance (global): TTL={}, decayed={}",
-                result.ttl_applied, result.decayed
-            );
-        }
-    }
 
     // Reindex: enfileirar memórias sem embedding para processamento
     let unindexed_personality = storage::get_unindexed_memories(&conn_personality).unwrap_or_default();
@@ -824,32 +775,45 @@ async fn main() -> Result<()> {
     drop(conn_global);
     drop(conn_personality);
 
-    // Carrega embedding engine
+    // Embedding engine com lazy-load: o modelo só carrega quando houver trabalho real.
     let engine = Arc::new(EmbeddingEngine::new()?);
 
     // Background worker
     let job_sender = embedding::start_background_worker(engine.clone());
 
     // Auto-reindex: enfileirar memórias sem embedding
+    let mut startup_dropped = 0usize;
     for (id, content) in &unindexed_personality {
-        let _ = job_sender.try_send(EmbeddingJob {
+        if job_sender.try_send(EmbeddingJob {
             db_path: paths.personality_db.to_string_lossy().to_string(),
             record_id: id.clone(),
             content: content.clone(),
-        });
+        }).is_err() {
+            startup_dropped += 1;
+        }
     }
     for (id, content) in &unindexed_global {
-        let _ = job_sender.try_send(EmbeddingJob {
+        if job_sender.try_send(EmbeddingJob {
             db_path: paths.global_db.to_string_lossy().to_string(),
             record_id: id.clone(),
             content: content.clone(),
-        });
+        }).is_err() {
+            startup_dropped += 1;
+        }
     }
     if total_unindexed > 0 {
-        info!("Queued {} unindexed memories for background embedding", total_unindexed);
+        info!(
+            "Queued {} unindexed memories for background embedding (dropped: {})",
+            total_unindexed.saturating_sub(startup_dropped),
+            startup_dropped
+        );
     }
 
     let server = MemoryServer::new(paths, engine, job_sender);
+    let maintenance_paths = (
+        server.paths.global_db.clone(),
+        server.paths.personality_db.clone(),
+    );
 
     info!("Search: hybrid (vector=0.7, text=0.3) + importance + graph 1-hop");
     info!("Embeddings: f16 compressed (50% less storage)");
@@ -864,6 +828,42 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("{:?}", e))?;
 
     info!("MCP server v0.3 rodando via stdio");
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let (global_db, personality_db) = maintenance_paths;
+            if let Ok(conn_global) = storage::init_db(&global_db) {
+                let migrated_global = embedding::migrate_embeddings_to_f16(&conn_global);
+                let maintenance_global = storage::compact_db(&conn_global, "global").ok();
+                if migrated_global > 0 {
+                    info!("Migrated {} global embeddings to f16", migrated_global);
+                }
+                if let Some(result) = maintenance_global {
+                    if result.ttl_applied > 0 || result.decayed > 0 {
+                        info!(
+                            "Auto-maintenance (global): TTL={}, decayed={}",
+                            result.ttl_applied, result.decayed
+                        );
+                    }
+                }
+            }
+            if let Ok(conn_personality) = storage::init_db(&personality_db) {
+                let migrated_personality = embedding::migrate_embeddings_to_f16(&conn_personality);
+                let maintenance_personality = storage::compact_db(&conn_personality, "personality").ok();
+                if migrated_personality > 0 {
+                    info!("Migrated {} personality embeddings to f16", migrated_personality);
+                }
+                if let Some(result) = maintenance_personality {
+                    if result.ttl_applied > 0 || result.decayed > 0 {
+                        info!(
+                            "Auto-maintenance (personality): TTL={}, decayed={}",
+                            result.ttl_applied, result.decayed
+                        );
+                    }
+                }
+            }
+        })
+        .await;
+    });
     service.waiting().await?;
 
     Ok(())

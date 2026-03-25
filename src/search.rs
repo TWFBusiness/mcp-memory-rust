@@ -120,6 +120,16 @@ pub fn search_embedding(
 ) -> Vec<SearchResult> {
     const MIN_SIM: f64 = 0.3;
     const MIN_IMPORTANCE: f64 = 0.2;
+    let memory_candidate_limit =
+        std::env::var("MEMORY_EMBED_CANDIDATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or((limit.max(1) as i64) * 200);
+    let chunk_candidate_limit =
+        std::env::var("MEMORY_EMBED_CHUNK_CANDIDATE_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or((limit.max(1) as i64) * 400);
 
     let mut results_map: std::collections::HashMap<String, SearchResult> =
         std::collections::HashMap::new();
@@ -128,9 +138,11 @@ pub fn search_embedding(
     if let Ok(mut stmt) = conn.prepare(
         "SELECT id, type, content, tags, created_at, embedding, importance \
          FROM memories WHERE embedding IS NOT NULL AND archived = 0 \
-         AND importance >= ?1",
+         AND importance >= ?1 \
+         ORDER BY importance DESC, access_count DESC, updated_at DESC \
+         LIMIT ?2",
     ) {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE], |row| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE, memory_candidate_limit], |row| {
             let id: String = row.get(0)?;
             let mem_type: String = row.get(1)?;
             let content: String = row.get(2)?;
@@ -168,9 +180,11 @@ pub fn search_embedding(
         "SELECT c.memory_id, c.embedding, m.type, m.content, m.tags, m.created_at, m.importance \
          FROM memory_chunks c JOIN memories m ON c.memory_id = m.id \
          WHERE c.embedding IS NOT NULL AND m.archived = 0 \
-         AND m.importance >= ?1",
+         AND m.importance >= ?1 \
+         ORDER BY m.importance DESC, m.access_count DESC, m.updated_at DESC \
+         LIMIT ?2",
     ) {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE], |row| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![MIN_IMPORTANCE, chunk_candidate_limit], |row| {
             let mem_id: String = row.get(0)?;
             let blob: Vec<u8> = row.get(1)?;
             let mem_type: String = row.get(2)?;
